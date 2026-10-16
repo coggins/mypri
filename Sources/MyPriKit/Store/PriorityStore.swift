@@ -16,6 +16,13 @@ public final class PriorityStore: ObservableObject {
         load()
     }
 
+    /// Every distinct assignee name used across all (non-deleted) items,
+    /// sorted alphabetically — powers the "Assigned To" autocomplete in
+    /// `DetailView`.
+    public var allAssigneeNames: [String] {
+        Array(Set(items.filter { !$0.isDeleted }.flatMap(\.assignees))).sorted()
+    }
+
     /// Points the store at a new backing file, optionally reloading its
     /// contents (pass `reload: false` right after writing a brand-new file
     /// so an empty read doesn't wipe out what was just written).
@@ -127,9 +134,20 @@ public final class PriorityStore: ObservableObject {
         var item = PriorityItem()
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         item.title = trimmed.isEmpty ? "New Priority" : trimmed
+        item.order = topOrder(for: item.priority)
         items.insert(item, at: 0)
         scheduleSave()
         return item.id
+    }
+
+    /// The order value that places an item above everything currently in
+    /// the given priority tier.
+    private func topOrder(for priority: PriorityLevel, excluding excludedId: UUID? = nil) -> Double {
+        let minExisting = items
+            .filter { $0.priority == priority && !$0.isDeleted && $0.id != excludedId }
+            .map(\.order)
+            .min()
+        return (minExisting ?? 0) - 1
     }
 
     /// Soft-delete: marks the item as deleted (tombstone) rather than
@@ -146,7 +164,20 @@ public final class PriorityStore: ObservableObject {
 
     public func setPriority(id: UUID, to priority: PriorityLevel) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        if items[idx].priority != priority {
+            items[idx].order = topOrder(for: priority, excluding: id)
+        }
         items[idx].priority = priority
+        items[idx].updatedAt = Date()
+        scheduleSave()
+    }
+
+    /// Closes or reopens an item. Unlike `delete`, this is a fully
+    /// user-visible, reversible state — closed items stay findable in the
+    /// UI's collapsed "Closed" section rather than disappearing.
+    public func setClosed(id: UUID, closed: Bool) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        items[idx].closedAt = closed ? Date() : nil
         items[idx].updatedAt = Date()
         scheduleSave()
     }
@@ -165,10 +196,37 @@ public final class PriorityStore: ObservableObject {
             set: { [weak self] newValue in
                 guard let self, let idx = self.index(of: id) else { return }
                 var updated = newValue
+                if updated.priority != self.items[idx].priority {
+                    updated.order = self.topOrder(for: updated.priority, excluding: id)
+                }
                 updated.updatedAt = Date()
                 self.items[idx] = updated
                 self.scheduleSave()
             }
         )
+    }
+
+    /// Reorders items within a single priority tier (drag-to-reorder).
+    /// `source`/`destination` follow `Array.move(fromOffsets:toOffset:)`
+    /// semantics over that tier's own items sorted by `order` — the same
+    /// array a `List` section for this tier would be displaying, so this is
+    /// meant to be called directly from a `.onMove` handler.
+    public func moveItems(priority: PriorityLevel, fromOffsets source: IndexSet, toOffset destination: Int) {
+        var group = items
+            .filter { $0.priority == priority && !$0.isDeleted }
+            .sorted { $0.order < $1.order }
+        group.move(fromOffsets: source, toOffset: destination)
+
+        var didChange = false
+        for (position, groupItem) in group.enumerated() {
+            let newOrder = Double(position)
+            guard groupItem.order != newOrder, let idx = index(of: groupItem.id) else { continue }
+            items[idx].order = newOrder
+            items[idx].updatedAt = Date()
+            didChange = true
+        }
+        if didChange {
+            scheduleSave()
+        }
     }
 }

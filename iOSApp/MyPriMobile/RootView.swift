@@ -30,7 +30,7 @@ struct RootView: View {
                 }
             }
             .navigationDestination(for: UUID.self) { id in
-                DetailView(item: store.binding(for: id)) {
+                DetailView(item: store.binding(for: id), knownAssignees: store.allAssigneeNames) {
                     popDetail()
                 }
                 .navigationTitle(store.items.first(where: { $0.id == id })?.title ?? "Priority")

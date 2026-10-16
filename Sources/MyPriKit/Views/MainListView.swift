@@ -5,7 +5,12 @@ public struct MainListView: View {
     var onOpenItem: (UUID) -> Void
 
     @State private var newTitle: String = ""
+    @State private var searchText: String = ""
+    @State private var hiddenPriorities: Set<PriorityLevel> = []
+    @State private var isReordering = false
     @State private var refreshSpin: Double = 0
+    @State private var isClosedSectionExpanded = false
+    @State private var selectedItemID: UUID?
 
     public init(store: PriorityStore, onOpenItem: @escaping (UUID) -> Void) {
         self.store = store
@@ -16,11 +21,47 @@ public struct MainListView: View {
         store.items.filter { !$0.isDeleted }
     }
 
-    private var sortedItems: [PriorityItem] {
-        visibleItems.sorted { lhs, rhs in
-            if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
-            return lhs.updatedAt > rhs.updatedAt
+    /// Non-deleted, non-closed items — what the normal priority tiers and
+    /// footer counts are built from.
+    private var activeItems: [PriorityItem] {
+        visibleItems.filter { !$0.isClosed }
+    }
+
+    private var isFiltering: Bool {
+        !hiddenPriorities.isEmpty || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func matchesSearch(_ item: PriorityItem, query: String) -> Bool {
+        guard !query.isEmpty else { return true }
+        if item.title.lowercased().contains(query) { return true }
+        if item.notes.lowercased().contains(query) { return true }
+        if item.assignees.contains(where: { $0.lowercased().contains(query) }) { return true }
+        return false
+    }
+
+    private var filteredItems: [PriorityItem] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return activeItems.filter { item in
+            guard !hiddenPriorities.contains(item.priority) else { return false }
+            return matchesSearch(item, query: query)
         }
+    }
+
+    private func group(for level: PriorityLevel) -> [PriorityItem] {
+        filteredItems.filter { $0.priority == level }.sorted { $0.order < $1.order }
+    }
+
+    private var activeLevels: [PriorityLevel] {
+        PriorityLevel.allCases.filter { !group(for: $0).isEmpty }
+    }
+
+    /// Closed items, most recently closed first — shown in a collapsed
+    /// section so they stay findable without cluttering the active list.
+    private var closedItems: [PriorityItem] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return visibleItems
+            .filter { $0.isClosed && matchesSearch($0, query: query) }
+            .sorted { ($0.closedAt ?? $0.updatedAt) > ($1.closedAt ?? $1.updatedAt) }
     }
 
     public var body: some View {
@@ -31,23 +72,10 @@ public struct MainListView: View {
                 header
                 Divider().overlay(Color.mpBorder)
 
-                if visibleItems.isEmpty {
+                if activeLevels.isEmpty && closedItems.isEmpty {
                     emptyState
                 } else {
-                    ScrollView {
-                        LazyVStack(spacing: 8) {
-                            ForEach(sortedItems) { item in
-                                ItemRowView(
-                                    item: item,
-                                    onOpen: { onOpenItem(item.id) },
-                                    onDelete: { store.delete(id: item.id) },
-                                    onSetPriority: { level in store.setPriority(id: item.id, to: level) }
-                                )
-                            }
-                        }
-                        .padding(10)
-                    }
-                    .refreshable { store.refresh() }
+                    list
                 }
 
                 Divider().overlay(Color.mpBorder)
@@ -55,6 +83,106 @@ public struct MainListView: View {
             }
         }
         .frame(minWidth: 220)
+    }
+
+    private var list: some View {
+        List(selection: $selectedItemID) {
+            ForEach(activeLevels) { level in
+                Section {
+                    ForEach(group(for: level)) { item in
+                        ItemRowView(
+                            item: item,
+                            onOpen: { onOpenItem(item.id) },
+                            onDelete: { store.delete(id: item.id) },
+                            onSetPriority: { newLevel in store.setPriority(id: item.id, to: newLevel) },
+                            onToggleClosed: { store.setClosed(id: item.id, closed: !item.isClosed) }
+                        )
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
+                        .deleteDisabled(true)
+                    }
+                    .onMove { source, destination in
+                        store.moveItems(priority: level, fromOffsets: source, toOffset: destination)
+                    }
+                    .moveDisabled(!searchText.isEmpty)
+                } header: {
+                    sectionHeader(level)
+                }
+            }
+
+            if !closedItems.isEmpty {
+                DisclosureGroup(isExpanded: $isClosedSectionExpanded) {
+                    ForEach(closedItems) { item in
+                        ItemRowView(
+                            item: item,
+                            onOpen: { onOpenItem(item.id) },
+                            onDelete: { store.delete(id: item.id) },
+                            onSetPriority: { newLevel in store.setPriority(id: item.id, to: newLevel) },
+                            onToggleClosed: { store.setClosed(id: item.id, closed: !item.isClosed) }
+                        )
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
+                        .deleteDisabled(true)
+                        .moveDisabled(true)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "archivebox")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Closed (\(closedItems.count))")
+                            .font(.system(size: 10, weight: .bold))
+                            .tracking(0.6)
+                        Spacer()
+                    }
+                    .foregroundColor(.mpTextTertiary)
+                }
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .onAppear {
+                    // This DisclosureGroup is only inserted into the List
+                    // once something is actually closed (`if
+                    // !closedItems.isEmpty`), and on that first insertion
+                    // SwiftUI renders it expanded regardless of the
+                    // `isExpanded` binding's value. Explicitly re-asserting
+                    // it here corrects that — harmless on a normal app
+                    // launch where it's already collapsed.
+                    isClosedSectionExpanded = false
+                }
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        #if os(iOS)
+        .environment(\.editMode, .constant(isReordering ? .active : .inactive))
+        #endif
+        .refreshable { store.refresh() }
+        .onChange(of: selectedItemID) { newValue in
+            // Selection (rather than a tap gesture or a row-wide Button) is
+            // what actually opens an item — a Button wrapping the whole row
+            // fights with List's native click-and-drag reordering on macOS,
+            // since both try to interpret the same mouse-down. Selection is
+            // the one interaction List is built to share cleanly with
+            // dragging. We reset it right after acting on it so the next
+            // click on the same row is a fresh nil → id transition and
+            // reliably fires again.
+            guard let id = newValue else { return }
+            onOpenItem(id)
+            selectedItemID = nil
+        }
+    }
+
+    private func sectionHeader(_ level: PriorityLevel) -> some View {
+        HStack(spacing: 6) {
+            Circle().fill(level.color).frame(width: 6, height: 6)
+            Text("\(level.label) · \(level.description)")
+                .font(.system(size: 10, weight: .bold))
+                .tracking(0.6)
+            Spacer()
+        }
+        .foregroundColor(.mpTextTertiary)
+        .textCase(nil)
     }
 
     private var header: some View {
@@ -72,6 +200,25 @@ public struct MainListView: View {
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundColor(.mpTextPrimary)
                 Spacer()
+
+                #if os(iOS)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        if isReordering {
+                            isReordering = false
+                        } else {
+                            searchText = ""
+                            isReordering = true
+                        }
+                    }
+                } label: {
+                    Image(systemName: isReordering ? "checkmark.circle.fill" : "arrow.up.arrow.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(LinearGradient.mpAccent)
+                }
+                .buttonStyle(.plain)
+                .help(isReordering ? "Done reordering" : "Reorder priorities")
+                #endif
 
                 Button {
                     store.refresh()
@@ -105,6 +252,30 @@ public struct MainListView: View {
                 .buttonStyle(.plain)
                 .help("Add Priority")
             }
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11))
+                    .foregroundColor(.mpTextTertiary)
+                TextField("Search", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundColor(.mpTextPrimary)
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(.mpTextTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.mpSurface))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.mpBorder, lineWidth: 1))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -119,33 +290,69 @@ public struct MainListView: View {
     private var emptyState: some View {
         VStack(spacing: 10) {
             Spacer()
-            Image(systemName: "tray")
+            Image(systemName: isFiltering ? "line.3.horizontal.decrease.circle" : "tray")
                 .font(.system(size: 30))
                 .foregroundColor(.mpTextTertiary)
-            Text("No priorities yet")
+            Text(isFiltering ? "No matching priorities" : "No priorities yet")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.mpTextSecondary)
-            Button("Add your first priority") { addAndOpen() }
+            if isFiltering {
+                Button("Clear filters") {
+                    withAnimation {
+                        hiddenPriorities.removeAll()
+                        searchText = ""
+                    }
+                }
                 .buttonStyle(.plain)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(LinearGradient.mpAccent)
+            } else {
+                Button("Add your first priority") { addAndOpen() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(LinearGradient.mpAccent)
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var footer: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             ForEach(PriorityLevel.allCases) { level in
-                let count = visibleItems.filter { $0.priority == level }.count
-                HStack(spacing: 4) {
-                    Circle().fill(level.color).frame(width: 6, height: 6)
-                    Text("\(level.label) \(count)")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.mpTextSecondary)
+                let count = activeItems.filter { $0.priority == level }.count
+                let isHidden = hiddenPriorities.contains(level)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if isHidden {
+                            hiddenPriorities.remove(level)
+                        } else {
+                            hiddenPriorities.insert(level)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Circle().fill(level.color).frame(width: 6, height: 6)
+                        Text("\(level.label) \(count)")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.mpTextSecondary)
+                    .opacity(isHidden ? 0.4 : 1)
                 }
+                .buttonStyle(.plain)
+                .help(isHidden ? "Show \(level.label)" : "Hide \(level.label)")
             }
+
             Spacer()
+
+            if !hiddenPriorities.isEmpty {
+                Button("Show All") {
+                    withAnimation { hiddenPriorities.removeAll() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(LinearGradient.mpAccent)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

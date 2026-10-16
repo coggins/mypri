@@ -5,19 +5,23 @@ public struct ItemRowView: View {
     var onOpen: () -> Void
     var onDelete: () -> Void
     var onSetPriority: (PriorityLevel) -> Void
+    var onToggleClosed: () -> Void
 
     @State private var hovering = false
+    @State private var showDeleteConfirmation = false
 
     public init(
         item: PriorityItem,
         onOpen: @escaping () -> Void,
         onDelete: @escaping () -> Void,
-        onSetPriority: @escaping (PriorityLevel) -> Void
+        onSetPriority: @escaping (PriorityLevel) -> Void,
+        onToggleClosed: @escaping () -> Void
     ) {
         self.item = item
         self.onOpen = onOpen
         self.onDelete = onDelete
         self.onSetPriority = onSetPriority
+        self.onToggleClosed = onToggleClosed
     }
 
     private var trimmedNotes: String {
@@ -40,6 +44,7 @@ public struct ItemRowView: View {
                         .foregroundColor(.mpTextPrimary)
                         .lineLimit(2)
                 }
+                .padding(.trailing, 56)
 
                 if !item.assignees.isEmpty {
                     FlowLayout(spacing: 6) {
@@ -80,9 +85,14 @@ public struct ItemRowView: View {
                 .stroke(Color.mpBorder, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .onHover { hovering = $0 }
+        .opacity(item.isClosed ? 0.6 : 1)
         .contentShape(Rectangle())
-        .onTapGesture(perform: onOpen)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .topTrailing) {
+            rowActionButtons
+                .padding(.top, 10)
+                .padding(.trailing, 10)
+        }
         .contextMenu {
             Button("Open Details") { onOpen() }
             Menu("Set Priority") {
@@ -99,7 +109,46 @@ public struct ItemRowView: View {
                 }
             }
             Divider()
+            Button(item.isClosed ? "Reopen" : "Close") { onToggleClosed() }
+            Divider()
+            Button("Delete", role: .destructive) { showDeleteConfirmation = true }
+        }
+        .confirmationDialog(
+            "Delete \"\(item.title.isEmpty ? "Untitled" : item.title)\"?",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
             Button("Delete", role: .destructive) { onDelete() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This can't be undone.")
+        }
+    }
+
+    /// Small always-visible quick actions in the row's top-right corner —
+    /// same actions as the context menu, but discoverable without a
+    /// right-click/long-press, and usable identically by touch on iOS.
+    private var rowActionButtons: some View {
+        HStack(spacing: 14) {
+            Button {
+                onToggleClosed()
+            } label: {
+                Image(systemName: item.isClosed ? "arrow.uturn.backward.circle" : "checkmark.circle")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.mpTextTertiary)
+            .help(item.isClosed ? "Reopen" : "Close")
+
+            Button {
+                showDeleteConfirmation = true
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(Color.red.opacity(0.75))
+            .help("Delete")
         }
     }
 }

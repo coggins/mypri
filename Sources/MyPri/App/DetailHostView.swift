@@ -15,6 +15,6 @@ struct DetailHostView: View {
     let onClose: () -> Void
 
     var body: some View {
-        DetailView(item: store.binding(for: id), onClose: onClose)
+        DetailView(item: store.binding(for: id), knownAssignees: store.allAssigneeNames, onClose: onClose)
     }
 }
